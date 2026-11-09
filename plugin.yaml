@@ -1,0 +1,6 @@
+name: command-note-guard
+version: "0.1.0"
+description: "Block risky terminal commands that lack a leading purpose comment, so approval cards show intent, write target, and blast radius."
+author: "James"
+provides_hooks:
+  - pre_tool_call
