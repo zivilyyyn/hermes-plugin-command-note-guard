@@ -4,9 +4,9 @@
 
 Hermes `pre_tool_call` 插件。执行 `terminal` 前检查命令是否带有审计摘要：
 
-- 只读命令、未命中风险形态的命令：直接放行。
-- 命中风险形态且摘要完整：放行，**不改写命令**。
-- 命中风险形态但摘要缺失或不完整：退回该次调用（`action: block`，命令未执行），提示模型补齐摘要后，在同一轮里**原样重发同一条命令**。
+- 不会进入 Hermes 审批/密码流程的命令：直接放行。
+- 会进入审批/密码流程且摘要完整：放行，**不改写命令**。
+- 会进入审批/密码流程但摘要缺失或不完整：退回该次调用（`action: block`，命令未执行），提示模型补齐摘要后，在同一轮里**原样重发同一条命令**。
 
 默认模式是 `strict`。插件不会代写摘要，摘要必须由当时的模型自己写。
 
@@ -39,15 +39,15 @@ rm -rf /tmp/x
 
 ## 退回后的流程
 
-1. 第一次调用命中风险形态但缺少摘要，插件返回 `block`，命令不会执行。
-2. 审批卡片显示命中形态、缺少项（`label` / `用途` / `写入` / `失败影响`）和三行格式示例。
+1. 第一次调用会进入审批但缺少摘要，插件返回 `block`，命令不会执行。
+2. 审批卡片显示命中项、缺少项（`label` / `用途` / `写入` / `失败影响`）和三行格式示例。
 3. 模型按格式补写摘要，在**同一轮**里原样重发同一条命令（命令本身不要改）。
 4. 摘要完整后插件放行；后续命令照常执行。
 
 退回提示固定为：
 
 ```text
-这条命令缺少审计摘要，已退回（未执行）。命中形态：recursive-delete
+这条命令缺少审计摘要，已退回（未执行）。命中形态：recursive delete
 缺：label、用途、写入、失败影响
 
 请补成三行注释后，原样重发同一条命令（命令本身不要改）：
@@ -63,14 +63,14 @@ rm -rf /tmp/x
 
 ## execute_code 覆盖
 
-`execute_code` 在沙箱里可以通过 `hermes_tools.terminal(command, ...)`（含别名导入）回调真正的 `terminal` 工具，同样会触发审批与 `sudo` 密码框。插件会对 `execute_code` 的 `code` 做静态分析，取出其中每个 `terminal(...)` 调用的 command，套用同一套风险形态与三行摘要规则。
+`execute_code` 在沙箱里可以通过 `hermes_tools.terminal(command, ...)`（含别名导入）回调真正的 `terminal` 工具，同样会触发审批与 `sudo` 密码框。插件会对 `execute_code` 的 `code` 做静态分析，取出其中每个 `terminal(...)` 调用的 command，套用同一套审批判据与三行摘要规则。
 
 覆盖范围：
 
 - 直接字符串字面量：`terminal("rm -rf /tmp/x")`。
 - `command=` 关键字：`terminal(command="kill 123")`。
 - 同一函数体或模块级、调用之前最近一次 `ast.Constant(str)` 赋值：`cmd = "rm -rf /tmp/x"; terminal(cmd)`。只回溯一层，不做控制流分析。
-- f-string 的静态部分：`terminal(f"rm -rf {p}")` 按 `rm -rf {}` 近似文本判断形态与摘要。
+- f-string 的静态部分：`terminal(f"rm -rf {p}")` 按 `rm -rf {}` 近似文本判断审批命中项与摘要。
 - 函数别名与属性调用：`from hermes_tools import terminal as t` 之后的 `t(...)`，以及 `hermes_tools.terminal(...)`。
 
 不覆盖（静态取不到 command 时直接放行，不会代写摘要）：
@@ -98,13 +98,13 @@ Python 源码里的注释不算摘要。多个 `terminal()` 调用都不合格�
 环境变量在插件导入时读取一次，修改后需重载 Hermes。
 
 ```bash
-# 默认（都不设）：strict，命中风险形态就要求三行摘要，缺失即退回
+# 默认（都不设）：strict，会进入审批就要求三行摘要，缺失即退回
 unset COMMAND_NOTE_GUARD COMMAND_NOTE_GUARD_DRY
 
 # 完全关闭：不注册、不生效；0 / false 等价
 export COMMAND_NOTE_GUARD=off
 
-# 宽松：命中风险形态时只要求首行是 #，不检查三键
+# 宽松：会进入审批时只要求首行是 #，不检查三键
 export COMMAND_NOTE_GUARD=lenient
 
 # 旧行为回退：不拦截，自动补一行摘要后放行
@@ -119,7 +119,7 @@ export COMMAND_NOTE_GUARD_DRY=1
 ### annotate 旧行为
 
 ```text
-# 【自动补注】recursive-delete | 对象：/tmp/x | 后果：删除目录及其内容，不可恢复
+# 【自动补注】recursive delete | 对象：/tmp/x | 后果：recursive delete
 rm -rf /tmp/x
 ```
 
@@ -127,39 +127,53 @@ rm -rf /tmp/x
 - 原命令逐字保留在第二行，缩进、换行都不变。
 - 首行（第一个非空行）已经是 `#` 注释时不补注。
 - 摘要只用于审批卡片展示，不参与执行；命令照常运行。
-- 日志只记录命中的形态名，不记录命令正文或对象内容。
+- 日志只记录命中项，不记录命令正文或对象内容。
 
-## 命中形态
+## 判据来源：Hermes 审批模块
 
-| 短名 | 判定 |
-|---|---|
-| `recursive-delete` | `rm -r` / `rm -rf` / `rm --recursive` |
-| `sql-drop` | `DROP TABLE` / `DATABASE` / `SCHEMA` / `INDEX`（忽略大小写） |
-| `redirect-write` | `>` / `>>` 写入真实文件；`/dev/null` 与 `2>&1` 等丢弃输出写法除外 |
-| `inline-script` | `python -c`、`bash -c`、`node -e` 等直接执行代码 |
-| `heredoc` | `<<EOF`、`<<'EOF'`、`<<-EOF` |
-| `kill-process` | `kill` / `pkill` / `killall` / `Stop-Process` |
-| `permissions` | `chmod` / `chown` |
-| `launchd` | `launchctl` 的 bootout / bootstrap / kickstart / load / unload / enable / disable |
-| `remote-copy` | `scp` / `rsync` |
-| `remote-exec` | `ssh` + 远端写动词：`rm` / `cp` / `mv` / `dd` / `tee` / `chmod` / `chown` / `kill` / `pkill` / `launchctl` / `scp` / `rsync`（引号内也算）；`ssh host ls`、`ssh host cat x` 等只读不命中 |
-| `privilege` | 非注释行中的 `sudo` |
-| `system-path-write` | 路径命中 `/etc/`、`/Library/LaunchDaemons/`、`/System/`、`/private/etc/`、`~/.hermes/config.yaml`、`$HOME/.hermes/config.yaml`，**且**命令同时含写语义（重定向、`tee`、`cp`、`mv`、`install`、`sed -i`、`rm`、`chmod`、`chown`、`ln`、`truncate`、`dd`、`defaults write`、`plutil -replace`、`crontab`）；对只读动词主导的命令（`cat`、`ls`、`grep` 等）豁免 |
+插件不再维护自己的风险形态清单。判据只有一个问题：**这条命令会不会进入 Hermes 的审批/密码流程**。
 
-同一命令可能命中多个形态，日志与退回提示会列出全部命中项。
+命中检测直接调用 Hermes 源码里的两个纯函数（延迟 import，避免插件加载期失败）：
+
+```python
+from tools.approval_detection import (
+    detect_dangerous_command,
+    detect_hardline_command,
+)
+```
+
+- `detect_hardline_command(command)` 返回 `(True, description)`：追加 `hardline:<description>`。这是 Hermes 的硬拦截底线，`--yolo` 也不能绕过。
+- `detect_dangerous_command(command)` 返回 `(True, key, description)`：追加 `description or key`。这与 `terminal_tool` 的审批守卫使用同一张 `DANGEROUS_PATTERNS` 表。
+- 非注释行里出现 `\bsudo\b`：追加 `sudo`。`sudo` 会单独触发密码框，不包含在上面两个函数里。
+
+也就是说，这里的命中集合与 Hermes 审批守卫同源；Hermes 不要求审批的命令，本插件也不要求摘要。
+
+### 相比旧清单的行为变化
+
+旧版按自建形态表判断，会对一些实际不进入审批的命令要求摘要。以下命令现在**不再要求摘要**：
+
+- `scp` / `rsync`：分类器不 flag（除非同时命中真正的危险模式）；旧清单的 `remote-copy` 命中已不再要求摘要。
+- `chmod` / `chown` 的普通权限修改（例如 `chmod 700 ~/x.sh`）：只有 `777` / `666` / other-writable、递归 chown root 等危险写法才命中；旧清单的 `permissions` 命中已不再要求摘要。
+- `launchctl print` 等只读子命令：分类器不 flag，因此不要求摘要（旧清单本来也只匹配操作类子命令）。普通服务的 `launchctl bootout gui/501/local.foo` 则从旧清单的 `launchd` 命中变为不要求摘要；分类器只对 `ai.hermes` / `hermes` 网关标签的 `stop` / `kickstart` / `bootout` / `unload` / `kill` / `disable` / `remove` 报审批。
+- 普通重定向到非敏感目标（例如 `echo hi > /dev/null 2>&1`）：不命中（旧清单也排除了 `/dev/null` 与 `2>&1`）；`> /etc/...` 等敏感路径仍会命中。
+- 普通 `kill -9 <pid>`：分类器只 flag `kill -9 -1`、`pkill -9` 等宽范围终止；旧清单的 `kill-process` 命中已不再要求摘要。
+
+反过来，旧清单未覆盖但 Hermes 会审批的命令（例如 SQL `DELETE` 无 `WHERE`、`git reset --hard`、敏感路径写入等）现在也会要求摘要。`python3 -c 'print(1)'` 也仍会命中 `script execution via -e/-c flag`，因为分类器本身就会 flag 内联脚本。
+
+同一命令可能命中多个项，日志与退回提示会列出全部命中项。
 
 ## 日志
 
-- 退回：`command-note-guard: blocked <hits> missing=<missing>`，只记录形态名和缺失项，不记录命令正文。
+- 退回：`command-note-guard: blocked <hits> missing=<missing>`，只记录命中项和缺失项，不记录命令正文。
 - annotate：`command-note-guard: annotated <hits>`。
 - 灰测：`command-note-guard: dry-run missing=<missing> hits=<hits>`。
 - 关闭：`command-note-guard: disabled by COMMAND_NOTE_GUARD`。
 
 ## 已知局限
 
-1. 纯计算的 `python3 -c 'print(1)'` 也会命中 `inline-script`，需要写摘要，但实际可能没有任何副作用。
-2. 普通调试输出 `echo test > /tmp/x.log` 会命中 `redirect-write`（写入系统路径时还会命中 `system-path-write`），即使只是日志也要写摘要。
-3. `chmod` / `chown` 即使作用于临时文件也会命中 `permissions`；`ssh` 的远端复合命令只要出现写动词就整体命中 `remote-exec`，无法区分远端只读部分。
-4. 摘要只认命令开头连续的 `#` 行；摘要与命令之间插入空行，或把摘要写到命令之后，都会被判为缺失。
-5. 风险形态匹配仍会扫过注释文本本身；注释里出现 `rm`、`launchctl bootout` 等词时，可能被当作风险形态命中。
+1. `execute_code` 只做静态分析：动态拼接、函数返回值、下标、`join`、多层变量传递等取不到字面量的 command 会直接放行。例如 `cmd = "rm " + "-rf /tmp/x"`。
+2. 通过 `subprocess`、`os.system` 等自行调起的命令不在 `terminal` 的审批路径上，插件也看不到。
+3. 插件跑在 host 隔离模式、无法 import `tools.approval_detection` 时，按 fail-open 处理：不要求摘要，只记一次 warning。此时判据实际失效。
+4. 判据与 Hermes 审批守卫同源：Hermes 分类器不 flag 的命令，本插件也不会要求摘要；这不是「命令一定安全」的保证。
+5. 摘要只认命令开头连续的 `#` 行；摘要与命令之间插入空行，或把摘要写到命令之后，都会被判为缺失。
 6. 插件内部异常一律放行；任何解析失败都不会阻止命令执行。
