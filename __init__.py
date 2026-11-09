@@ -20,6 +20,7 @@ Fail-open: any unexpected error returns ``None`` so the tool still runs.
 
 from __future__ import annotations
 
+import ast
 import logging
 import os
 import re
@@ -599,12 +600,253 @@ def _block_message(hits: list[str], missing: list[str]) -> str:
     )
 
 
+def _extract_terminal_commands(code: str) -> list[tuple[int, str]]:
+    """Statically extract ``terminal(...)`` command strings from Python code.
+
+    Returns ``(index, command)`` pairs in source order, where ``index`` is the
+    1-based position of the terminal call in the source (including calls whose
+    command could not be resolved). Returns an empty list on any parse error.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        logger.debug("command-note-guard: execute_code SyntaxError; allowing")
+        return []
+    except Exception:
+        logger.debug("command-note-guard: execute_code parse failed; allowing")
+        return []
+
+    try:
+        function_names = {"terminal"}
+        module_names = {"hermes_tools"}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module == "hermes_tools":
+                for alias in node.names:
+                    if alias.name == "terminal":
+                        function_names.add(alias.asname or alias.name)
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name == "hermes_tools":
+                        module_names.add(alias.asname or alias.name)
+
+        assignments: dict[Any, list[tuple[tuple[int, int], str, str]]] = {}
+        calls: list[tuple[tuple[int, int], Any, ast.Call]] = []
+
+        def record_assignment(node: ast.AST, scope: Any) -> None:
+            value = getattr(node, "value", None)
+            if not (
+                isinstance(value, ast.Constant) and isinstance(value.value, str)
+            ):
+                return
+            if isinstance(node, ast.Assign):
+                targets = node.targets
+            else:
+                targets = [getattr(node, "target", None)]
+            position = (node.lineno, node.col_offset)
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    assignments.setdefault(scope, []).append(
+                        (position, target.id, value.value)
+                    )
+
+        def visit(node: ast.AST, scope: Any) -> None:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                # Decorators and defaults belong to the enclosing scope.
+                for child in node.decorator_list:
+                    visit(child, scope)
+                visit(node.args, scope)
+                for stmt in node.body:
+                    visit(stmt, node)
+                return
+            if isinstance(node, ast.Lambda):
+                visit(node.args, scope)
+                visit(node.body, node)
+                return
+            if isinstance(node, ast.ClassDef):
+                for child in node.decorator_list + node.bases + node.keywords:
+                    visit(child, scope)
+                for stmt in node.body:
+                    visit(stmt, node)
+                return
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                record_assignment(node, scope)
+            if isinstance(node, ast.Call):
+                calls.append(((node.lineno, node.col_offset), scope, node))
+            for child in ast.iter_child_nodes(node):
+                visit(child, scope)
+
+        visit(tree, None)
+
+        def is_terminal_call(call: ast.Call) -> bool:
+            func = call.func
+            if isinstance(func, ast.Name):
+                return func.id in function_names
+            if isinstance(func, ast.Attribute) and func.attr == "terminal":
+                return (
+                    isinstance(func.value, ast.Name)
+                    and func.value.id in module_names
+                )
+            return False
+
+        def command_argument(call: ast.Call) -> Optional[ast.AST]:
+            if call.args:
+                return call.args[0]
+            for keyword in call.keywords:
+                if keyword.arg == "command":
+                    return keyword.value
+            return None
+
+        def resolve_name(
+            name: str, scope: Any, position: tuple[int, int]
+        ) -> Optional[str]:
+            best: Optional[tuple[tuple[int, int], str]] = None
+            for assigned_at, target, value in assignments.get(scope, []):
+                if target == name and assigned_at < position:
+                    if best is None or assigned_at > best[0]:
+                        best = (assigned_at, value)
+            return best[1] if best is not None else None
+
+        def command_text(
+            call: ast.Call, scope: Any, position: tuple[int, int]
+        ) -> Optional[str]:
+            argument = command_argument(call)
+            if argument is None:
+                return None
+            if isinstance(argument, ast.Constant):
+                return argument.value if isinstance(argument.value, str) else None
+            if isinstance(argument, ast.Name):
+                resolved = resolve_name(argument.id, scope, position)
+                if resolved is None:
+                    logger.debug(
+                        "command-note-guard: execute_code unresolved name; skipping"
+                    )
+                return resolved
+            if isinstance(argument, ast.JoinedStr):
+                parts: list[str] = []
+                for value in argument.values:
+                    if (
+                        isinstance(value, ast.Constant)
+                        and isinstance(value.value, str)
+                    ):
+                        parts.append(value.value)
+                    else:
+                        parts.append("{}")
+                return "".join(parts)
+            logger.debug(
+                "command-note-guard: execute_code unsupported command argument; skipping"
+            )
+            return None
+
+        terminal_calls = [
+            entry
+            for entry in sorted(calls, key=lambda item: item[0])
+            if is_terminal_call(entry[2])
+        ]
+        extracted: list[tuple[int, str]] = []
+        for index, (position, scope, call) in enumerate(terminal_calls, start=1):
+            command = command_text(call, scope, position)
+            if command is not None:
+                extracted.append((index, command))
+        return extracted
+    except Exception:
+        logger.debug("command-note-guard: execute_code extraction failed; allowing")
+        return []
+
+
+def _check_execute_code(code: str) -> Optional[list[dict[str, Any]]]:
+    """Return per-call missing-note reports, or ``None`` when all calls pass."""
+    try:
+        if not isinstance(code, str) or not code.strip():
+            return None
+        failures: list[dict[str, Any]] = []
+        for index, command in _extract_terminal_commands(code):
+            hits = _match_risk(command)
+            if not hits:
+                continue
+            if _LENIENT_MODE:
+                ok = _first_nonempty_line(command).startswith("#")
+                missing = [] if ok else ["label"]
+            else:
+                ok, missing = _note_status(command)
+            if not ok:
+                failures.append(
+                    {"index": index, "hits": hits, "missing": missing}
+                )
+        return failures or None
+    except Exception:
+        logger.debug("command-note-guard: execute_code check failed; allowing")
+        return None
+
+
+def _execute_block_message(failure: dict[str, Any], total: int) -> str:
+    """Build the retry message for one non-compliant execute_code call."""
+    names = "、".join(failure["hits"])
+    lacking = "、".join(failure["missing"])
+    lines = [
+        f"execute_code 里第 {failure['index']} 个 terminal() 调用缺少审计摘要，"
+        f"已退回（未执行）。命中形态：{names}",
+        f"缺：{lacking}",
+        "",
+        "请在该命令字符串里补成三行注释后重发（命令本身不要改）：",
+        "# 【新改动|回滚|只读】用途=做什么",
+        "# 写入=写到哪（只读写 无）",
+        "# 失败影响=失败会怎样",
+        "",
+        "注意：摘要必须是 command 字符串开头的三行 `#` 注释，Python 注释不算。",
+    ]
+    if total > 1:
+        lines.append(f"共 {total} 个调用不合格")
+    return "\n".join(lines)
+
+
+def _on_execute_code(args: Any) -> Optional[dict[str, Any]]:
+    """Check terminal calls nested inside an ``execute_code`` payload."""
+    if not isinstance(args, dict):
+        return None
+    code = args.get("code")
+    if not isinstance(code, str) or not code.strip():
+        return None
+    report = _check_execute_code(code)
+    if not report:
+        return None
+    if _ANNOTATE_MODE:
+        logger.info(
+            "command-note-guard: execute_code annotate pass calls=%d",
+            len(report),
+        )
+        return None
+    if _DRY_RUN:
+        for failure in report:
+            logger.info(
+                "command-note-guard: dry-run execute_code #%d missing=%s hits=%s",
+                failure["index"],
+                ",".join(failure["missing"]),
+                ",".join(failure["hits"]),
+            )
+        return None
+    first = report[0]
+    logger.info(
+        "command-note-guard: blocked execute_code #%d %s missing=%s",
+        first["index"],
+        ",".join(first["hits"]),
+        ",".join(first["missing"]),
+    )
+    return {
+        "action": "block",
+        "message": _execute_block_message(first, len(report)),
+    }
+
+
 def _on_pre_tool_call(
     tool_name: str = "", args: Any = None, **_: Any
 ) -> Optional[dict[str, Any]]:
     """Block risky terminal commands whose audit note is incomplete."""
     try:
-        if _DISABLED or tool_name != "terminal":
+        if _DISABLED:
+            return None
+        if tool_name == "execute_code":
+            return _on_execute_code(args)
+        if tool_name != "terminal":
             return None
         if not isinstance(args, dict):
             return None

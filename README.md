@@ -61,6 +61,38 @@ rm -rf /tmp/x
 # 失败影响=服务短暂中断，随后自动重连
 ```
 
+## execute_code 覆盖
+
+`execute_code` 在沙箱里可以通过 `hermes_tools.terminal(command, ...)`（含别名导入）回调真正的 `terminal` 工具，同样会触发审批与 `sudo` 密码框。插件会对 `execute_code` 的 `code` 做静态分析，取出其中每个 `terminal(...)` 调用的 command，套用同一套风险形态与三行摘要规则。
+
+覆盖范围：
+
+- 直接字符串字面量：`terminal("rm -rf /tmp/x")`。
+- `command=` 关键字：`terminal(command="kill 123")`。
+- 同一函数体或模块级、调用之前最近一次 `ast.Constant(str)` 赋值：`cmd = "rm -rf /tmp/x"; terminal(cmd)`。只回溯一层，不做控制流分析。
+- f-string 的静态部分：`terminal(f"rm -rf {p}")` 按 `rm -rf {}` 近似文本判断形态与摘要。
+- 函数别名与属性调用：`from hermes_tools import terminal as t` 之后的 `t(...)`，以及 `hermes_tools.terminal(...)`。
+
+不覆盖（静态取不到 command 时直接放行，不会代写摘要）：
+
+- 动态拼接、函数返回值、下标、`join` 等非字面量或非单层 `Name` 的 command。
+- 通过 `subprocess`、`os.system` 等自行调起的命令。
+- 多层变量传递：`a = "rm ..."; b = a; terminal(b)`。
+
+摘要必须写在 **command 字符串**开头，而不是 `execute_code` 的 Python 源码里。例如：
+
+```python
+from hermes_tools import terminal
+terminal(
+    "# 【只读】用途=查看目录\n"
+    "# 写入=无\n"
+    "# 失败影响=无\n"
+    "ls -la"
+)
+```
+
+Python 源码里的注释不算摘要。多个 `terminal()` 调用都不合格时，退回提示只报第一个，并给出不合格总数。
+
 ## 模式开关
 
 环境变量在插件导入时读取一次，修改后需重载 Hermes。
