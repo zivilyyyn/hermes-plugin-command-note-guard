@@ -593,9 +593,9 @@ def _block_message(hits: list[str], missing: list[str]) -> str:
         "# 失败影响=失败会怎样\n"
         "\n"
         "示例：\n"
-        "# 【新改动】用途=重启 Mac-Hub dashboard 加载新版插件\n"
-        "# 写入=launchctl gui/501 域\n"
-        "# 失败影响=面板短暂中断，自动重连"
+        "# 【新改动】用途=重启示例服务加载新版插件\n"
+        "# 写入=launchctl gui/<uid> 域\n"
+        "# 失败影响=服务短暂中断，随后自动重连"
     )
 
 
