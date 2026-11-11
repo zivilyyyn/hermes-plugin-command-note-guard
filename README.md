@@ -173,7 +173,7 @@ from tools.approval_detection import (
 
 1. `execute_code` 只做静态分析：动态拼接、函数返回值、下标、`join`、多层变量传递等取不到字面量的 command 会直接放行。例如 `cmd = "rm " + "-rf /tmp/x"`。
 2. 通过 `subprocess`、`os.system` 等自行调起的命令不在 `terminal` 的审批路径上，插件也看不到。
-3. 插件跑在 host 隔离模式、无法 import `tools.approval_detection` 时，按 fail-open 处理：不要求摘要，只记一次 warning。此时判据实际失效。
+3. 插件跑在 host 隔离模式、无法 import `tools.approval_detection` 时，启用一份五条兜底规则（`fallback:recursive-delete`、`fallback:sql-drop`、`fallback:inline-script`、`fallback:heredoc`、`fallback:sudo`），仍要求摘要，只记一次 warning。此时覆盖率明显低于正常路径，其余命令会放行。
 4. 判据与 Hermes 审批守卫同源：Hermes 分类器不 flag 的命令，本插件也不会要求摘要；这不是「命令一定安全」的保证。
 5. 摘要只认命令开头连续的 `#` 行；摘要与命令之间插入空行，或把摘要写到命令之后，都会被判为缺失。
 6. 插件内部异常一律放行；任何解析失败都不会阻止命令执行。

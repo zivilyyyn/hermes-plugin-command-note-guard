@@ -101,6 +101,38 @@ def _note_status(command: str) -> tuple[bool, list[str]]:
 
 _APPROVAL_IMPORT_WARNED = False
 
+# Minimal safety net used only when ``tools.approval_detection`` cannot be
+# imported. It is deliberately tiny and lower-coverage than the real
+# classifier; it only keeps the most dangerous command classes blocked.
+_FALLBACK_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("recursive-delete", re.compile(r"\brm\s+(?:--recursive\b|-[a-zA-Z]*[rR][a-zA-Z]*\b)")),
+    ("sql-drop", re.compile(r"\bdrop\s+(?:table|database|schema|index)\b", re.IGNORECASE)),
+    ("inline-script", re.compile(r"\b(?:python3?|ruby|perl|node|sh|bash|zsh)\s+-[a-zA-Z]*[ce]\b")),
+    ("heredoc", re.compile(r"<<-?\s*['\"]?[A-Za-z_][A-Za-z0-9_]*")),
+    ("sudo", re.compile(r"\bsudo\b")),
+)
+
+
+def _fallback_hits(command: str) -> list[str]:
+    """Return the minimal fallback hits for ``command``, or ``[]`` on error."""
+    try:
+        hits: list[str] = []
+        for name, pattern in _FALLBACK_PATTERNS:
+            if name == "sudo":
+                matched = any(
+                    pattern.search(line)
+                    for line in command.splitlines()
+                    if line.strip() and not line.strip().startswith("#")
+                )
+            else:
+                matched = pattern.search(command) is not None
+            if matched:
+                hits.append(f"fallback:{name}")
+        return hits
+    except Exception:
+        logger.debug("command-note-guard: fallback hit detection failed; allowing")
+        return []
+
 
 def _guard_hits(command: str) -> list[str]:
     """Return the approval-relevant reasons for this command.
@@ -108,8 +140,8 @@ def _guard_hits(command: str) -> list[str]:
     The decision is the same one Hermes' terminal approval guard makes: the
     hardline floor first, then the dangerous-command patterns, plus a plain
     ``sudo`` (which triggers the password prompt on its own). When the Hermes
-    source is unavailable (for example in host-isolation mode) detection is
-    fail-open: no hits, with one warning.
+    source is unavailable (for example in host-isolation mode) a minimal
+    five-rule fallback list is used instead, with one warning.
     """
     global _APPROVAL_IMPORT_WARNED
     try:
@@ -123,9 +155,9 @@ def _guard_hits(command: str) -> list[str]:
                 _APPROVAL_IMPORT_WARNED = True
                 logger.warning(
                     "command-note-guard: tools.approval_detection unavailable; "
-                    "approval-based detection disabled (fail-open)"
+                    "using minimal fallback rules (reduced coverage)"
                 )
-            return []
+            return _fallback_hits(command)
 
         hits: list[str] = []
         is_hardline, hardline_desc = detect_hardline_command(command)
