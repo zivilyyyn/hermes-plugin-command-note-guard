@@ -8,6 +8,8 @@ Hermes `pre_tool_call` 插件。执行 `terminal` 前检查命令是否带有审
 - 会进入审批/密码流程且摘要完整：放行，**不改写命令**。
 - 会进入审批/密码流程但摘要缺失或不完整：退回该次调用（`action: block`，命令未执行），提示模型补齐摘要后，在同一轮里**原样重发同一条命令**。
 
+`execute_code` 同样受管：先检查脚本级摘要（`code` 开头的三行 Python 注释），通过后再逐个检查 `terminal()` 的命令级摘要。详见「execute_code 覆盖」。
+
 默认模式是 `strict`。插件不会代写摘要，摘要必须由当时的模型自己写。
 
 ## 三行摘要格式
@@ -63,7 +65,50 @@ rm -rf /tmp/x
 
 ## execute_code 覆盖
 
-`execute_code` 在沙箱里可以通过 `hermes_tools.terminal(command, ...)`（含别名导入）回调真正的 `terminal` 工具，同样会触发审批与 `sudo` 密码框。插件会对 `execute_code` 的 `code` 做静态分析，取出其中每个 `terminal(...)` 调用的 command，套用同一套审批判据与三行摘要规则。
+`execute_code` 在子代理/injected 上下文里会走**整脚本审批**，审批卡片把整段 code 渲染成：
+
+```text
+execute_code <<'PY'
+<code 原文>
+PY
+```
+
+这段 `execute_code <<'PY' ... PY` 包装文本由 Hermes 生成，模型无法在里面加注释，所以摘要只能写在 **code 开头**的 Python 注释里。`execute_code` 因此是两层检查，按顺序执行。
+
+### 第一层：脚本级摘要
+
+每次 `execute_code` 的 `code` 最前面必须是一段连续的三行 Python 注释（遇到第一个非注释行即停止，空行也会截断）：
+
+```python
+# 【只读】用途=查看 /tmp 下的大文件
+# 写入=无
+# 失败影响=无
+
+from hermes_tools import terminal
+print(terminal("du -sh /tmp/* | sort -h | tail"))
+```
+
+- 即使脚本里一个 `terminal()` 都没有（例如纯 `print(1)`），也要求这三行。
+- 缺失或不完整时直接退回，不执行脚本。退回提示：
+
+  ```text
+  execute_code 脚本缺少审计摘要，已退回（未执行）。缺：label、用途、写入、失败影响
+
+  请在 code 最前面写三行 Python 注释后重发（代码本身不要改）：
+  # 【新改动|回滚|只读】用途=这段脚本要做什么
+  # 写入=写到哪（只读写 无）
+  # 失败影响=失败会怎样
+
+  注意：这三行必须是 code 的第一段内容（Python 注释），不是 shell 命令里的注释。
+  ```
+
+- 日志：`command-note-guard: blocked execute_code script missing=<missing>`，只记录缺失项，不记录 code 正文。
+- `lenient` 模式只要求 `code` 的第一个非空行以 `#` 开头。
+- `annotate` 模式不改 `code`，只记一条日志后放行。
+
+### 第二层：命令级摘要
+
+脚本级摘要通过后，插件再对 `code` 做静态分析，取出其中每个 `terminal(...)` 调用的 command，套用同一套审批判据与三行摘要规则。命令级摘要必须写在 **command 字符串**开头，脚本级摘要不能替代它。
 
 覆盖范围：
 
@@ -79,9 +124,13 @@ rm -rf /tmp/x
 - 通过 `subprocess`、`os.system` 等自行调起的命令。
 - 多层变量传递：`a = "rm ..."; b = a; terminal(b)`。
 
-摘要必须写在 **command 字符串**开头，而不是 `execute_code` 的 Python 源码里。例如：
+两层都齐全的完整示例：
 
 ```python
+# 【只读】用途=查看目录内容
+# 写入=无
+# 失败影响=无
+
 from hermes_tools import terminal
 terminal(
     "# 【只读】用途=查看目录\n"
@@ -91,7 +140,9 @@ terminal(
 )
 ```
 
-Python 源码里的注释不算摘要。多个 `terminal()` 调用都不合格时，退回提示只报第一个，并给出不合格总数。
+多个 `terminal()` 调用都不合格时，退回提示只报第一个，并给出不合格总数。
+
+> 注意：这要求**每一次 `execute_code` 都写脚本级摘要**，没有「脚本很安全就免写」的例外。这是用户已知并接受的成本，换取审批卡片上始终能看到脚本用途、写入点与失败影响。
 
 ## 模式开关
 
@@ -104,10 +155,10 @@ unset COMMAND_NOTE_GUARD COMMAND_NOTE_GUARD_DRY
 # 完全关闭：不注册、不生效；0 / false 等价
 export COMMAND_NOTE_GUARD=off
 
-# 宽松：会进入审批时只要求首行是 #，不检查三键
+# 宽松：会进入审批的 terminal 命令、以及 execute_code 脚本，都只要求首行是 #，不检查三键
 export COMMAND_NOTE_GUARD=lenient
 
-# 旧行为回退：不拦截，自动补一行摘要后放行
+# 旧行为回退：不拦截，terminal 命令自动补一行摘要后放行；execute_code 只记日志、不改 code
 export COMMAND_NOTE_GUARD=annotate
 
 # 灰测：只 logger.info 记录缺少项，不改命令、不拦截
@@ -165,7 +216,9 @@ from tools.approval_detection import (
 ## 日志
 
 - 退回：`command-note-guard: blocked <hits> missing=<missing>`，只记录命中项和缺失项，不记录命令正文。
-- annotate：`command-note-guard: annotated <hits>`。
+- execute_code 脚本级退回：`command-note-guard: blocked execute_code script missing=<missing>`，不记录 code 正文。
+- execute_code 命令级退回：`command-note-guard: blocked execute_code #<n> <hits> missing=<missing>`。
+- annotate：`command-note-guard: annotated <hits>`；execute_code 为 `command-note-guard: execute_code annotate pass ...`。
 - 灰测：`command-note-guard: dry-run missing=<missing> hits=<hits>`。
 - 关闭：`command-note-guard: disabled by COMMAND_NOTE_GUARD`。
 
@@ -175,5 +228,5 @@ from tools.approval_detection import (
 2. 通过 `subprocess`、`os.system` 等自行调起的命令不在 `terminal` 的审批路径上，插件也看不到。
 3. 插件跑在 host 隔离模式、无法 import `tools.approval_detection` 时，启用一份五条兜底规则（`fallback:recursive-delete`、`fallback:sql-drop`、`fallback:inline-script`、`fallback:heredoc`、`fallback:sudo`），仍要求摘要，只记一次 warning。此时覆盖率明显低于正常路径，其余命令会放行。
 4. 判据与 Hermes 审批守卫同源：Hermes 分类器不 flag 的命令，本插件也不会要求摘要；这不是「命令一定安全」的保证。
-5. 摘要只认命令开头连续的 `#` 行；摘要与命令之间插入空行，或把摘要写到命令之后，都会被判为缺失。
+5. 两层摘要都只认开头连续的 `#` 行；摘要与代码之间插入空行，或把摘要写到后面，都会被判为缺失。脚本级摘要必须是 `code` 的第一段内容，命令级摘要必须是 command 字符串的第一段内容。
 6. 插件内部异常一律放行；任何解析失败都不会阻止命令执行。

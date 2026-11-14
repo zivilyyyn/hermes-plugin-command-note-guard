@@ -12,6 +12,10 @@ lines:
 If any part is missing, the call is blocked without changing the command. The
 model rewrites the note and resends the same command in the same turn.
 
+``execute_code`` has two layers: the script itself must start with the same
+three Python comment lines, and each statically extracted ``terminal(...)``
+command must carry the three lines in its command string.
+
 ``COMMAND_NOTE_GUARD=annotate`` restores the old auto-annotation behaviour;
 ``lenient`` only requires a leading ``#`` line; ``off``/``0``/``false``
 disables the plugin; ``COMMAND_NOTE_GUARD_DRY=1`` only logs.
@@ -647,6 +651,21 @@ def _check_execute_code(code: str) -> Optional[list[dict[str, Any]]]:
         return None
 
 
+def _script_block_message(missing: list[str]) -> str:
+    """Build the retry message for a non-compliant execute_code script."""
+    lacking = "、".join(missing)
+    return (
+        f"execute_code 脚本缺少审计摘要，已退回（未执行）。缺：{lacking}\n"
+        "\n"
+        "请在 code 最前面写三行 Python 注释后重发（代码本身不要改）：\n"
+        "# 【新改动|回滚|只读】用途=这段脚本要做什么\n"
+        "# 写入=写到哪（只读写 无）\n"
+        "# 失败影响=失败会怎样\n"
+        "\n"
+        "注意：这三行必须是 code 的第一段内容（Python 注释），不是 shell 命令里的注释。"
+    )
+
+
 def _execute_block_message(failure: dict[str, Any], total: int) -> str:
     """Build the retry message for one non-compliant execute_code call."""
     names = "、".join(failure["hits"])
@@ -669,12 +688,40 @@ def _execute_block_message(failure: dict[str, Any], total: int) -> str:
 
 
 def _on_execute_code(args: Any) -> Optional[dict[str, Any]]:
-    """Check terminal calls nested inside an ``execute_code`` payload."""
+    """Check the script note, then terminal calls inside ``execute_code``."""
     if not isinstance(args, dict):
         return None
     code = args.get("code")
     if not isinstance(code, str) or not code.strip():
         return None
+
+    # Layer 1: script-level note, the leading consecutive Python comments.
+    if _LENIENT_MODE:
+        ok = _first_nonempty_line(code).startswith("#")
+        missing = [] if ok else ["label"]
+    else:
+        ok, missing = _note_status(code)
+
+    if not ok:
+        if _DRY_RUN:
+            logger.info(
+                "command-note-guard: dry-run execute_code script missing=%s",
+                ",".join(missing),
+            )
+            return None
+        if _ANNOTATE_MODE:
+            logger.info(
+                "command-note-guard: execute_code annotate pass script missing=%s",
+                ",".join(missing),
+            )
+            return None
+        logger.info(
+            "command-note-guard: blocked execute_code script missing=%s",
+            ",".join(missing),
+        )
+        return {"action": "block", "message": _script_block_message(missing)}
+
+    # Layer 2: command-level notes for every extracted terminal(...) call.
     report = _check_execute_code(code)
     if not report:
         return None
